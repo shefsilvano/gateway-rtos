@@ -21,6 +21,7 @@
 #define UART_PORT_SIM (UART_NUM_2) //uart port for the sim card module
 
 #define SENSOR_MAX_IND (5)
+#define SENSOR_MIN_IND (1)
 #define timestamp_len  (25)
 
 // private variables
@@ -52,20 +53,19 @@ typedef struct {
 } Sensor_Data; 
 
 Sensor_Data sensor_received;  //for debugginug only 
-Sensor_Data sensor_buffer[SENSOR_MAX_IND]; 
-bool sensor_low_batt = false; 
+
 
 //prototype functions 
 void init_uart (uart_port_t uart_num, int tx, int rx, int baud); 
 static void uart_event_task (void* arg); 
 static void process_uart_task(void* arg); 
 static void parse_sensor_data (char* buffer, Sensor_Data* sensor); 
-//static void send_to_sim(void *arg); 
+static void send_to_sim(void *arg); 
 
 
 // rtos handles
 static QueueHandle_t uart_queue;
-static QueueHandle_t data_queue;
+static QueueHandle_t data_queue; 
 
 static TaskHandle_t xProcess; 
 static BaseType_t process_task; 
@@ -84,14 +84,14 @@ void app_main(void)
     //init_uart(UART_PORT_SIM, UART_SIM_TX, UART_SIM_RX); 
 
     xParseReady = xSemaphoreCreateBinary(); 
-    data_queue = xQueueCreate(5,sizeof(Sensor_Data)); 
+    data_queue = xQueueCreate(1,(sizeof(Sensor_Data))*(SENSOR_MAX_IND+1)); // queue initialization
 
     xTaskCreate(uart_event_task, "uart_event", 4096, NULL, 5, NULL); 
     process_task = xTaskCreate(process_uart_task, "uart_process", 4096, NULL, 6, &xProcess);
     configASSERT(process_task == pdPASS); 
     
-   // sim_task = xTaskCreate(send_to_sim, "Sim Task", 2048, NULL, 7, &xSim); 
-   // configASSERT(sim_task == pdPASS); 
+    sim_task = xTaskCreate(send_to_sim, "sim_task", 4096, NULL, 7, &xSim); 
+    configASSERT(sim_task == pdPASS); 
 
 
 }
@@ -145,42 +145,52 @@ void init_uart (uart_port_t uart_num, int tx, int rx, int baud){
 }
 
 static void process_uart_task (void* arg){
-    // char print[10]; 
+
+    //redefine to tunnel data to another task instead of bathc processinign 
+    // char print[10];      
+    uint8_t received_count= 0;
     uint8_t curr_index = 0; 
+    bool index_received[SENSOR_MAX_IND+1] ={false}; 
     char*tx_ack ="type:1,ACK"; 
     char rx_data_buffer[UART_BUFFER_SIZE];
-
+    Sensor_Data sensor_buffer[SENSOR_MAX_IND+1];
+    memset(sensor_buffer, 0, sizeof(sensor_buffer));
     while (1){
         if (xSemaphoreTake(xParseReady, portMAX_DELAY)){ 
+             
             memset(rx_data_buffer,'\0',UART_BUFFER_SIZE); 
             strcpy(rx_data_buffer, &uart_rx_buffer[5]);
             memset(uart_rx_buffer,'\0',UART_BUFFER_SIZE); 
             switch (rx_data_buffer[5]){
                 case '0':
-                    Sensor_Data temp_data; //struct used only for this purpose; temporary data 
+                    Sensor_Data temp_data={0}; //struct used only for this purpose; temporary data 
                     parse_sensor_data(rx_data_buffer,&temp_data); //parse payload
-
                     
-                    if ((temp_data.index < SENSOR_MAX_IND) && (curr_index < 5)){
-                        sensor_buffer[temp_data.index] = temp_data; 
-                        temp_data.curr_index = curr_index; // just for debugging 
-                        curr_index++; 
-                        ESP_LOGI(TAG_SENSOR, "Data %i is saved",temp_data.index);  
-                        ESP_LOGI(TAG_SENSOR, "Parsed sensor data: ID=%d, Temp=%.2f, pH=%.2f, DO=%.2f, Batt=%.2f, timestamp=%s, Index=%d, Lowbatt statt=%d, curr_index=%d", temp_data.id, temp_data.temp, temp_data.pH, temp_data.DO, temp_data.batt,temp_data.timestamp, temp_data.index, temp_data.lowbatt, curr_index);
- 
-                    } else if(temp_data.lowbatt==1){
-                        uart_write_bytes(UART_PORT_H,tx_ack,10); //send ack to lowbatt 
-                        ESP_LOGI(TAG_SENSOR, "Acknowledged lowbatt."); 
-                        curr_index = 0;
-                    } else {
-                        xQueueSend(data_queue,sensor_buffer,portMAX_DELAY); 
-                        curr_index = 0; 
-                        ESP_LOGI(TAG_SENSOR, "Data is sent to queue");   
+                    if (temp_data.index >= SENSOR_MIN_IND && temp_data.index <= SENSOR_MAX_IND){
+                        curr_index = temp_data.index;
+                        if (!index_received[curr_index]){ //checks for duplicates only
+                            sensor_buffer[curr_index] = temp_data; 
+                            index_received[curr_index] = true; 
+                            received_count++; 
+                            ESP_LOGI(TAG_SENSOR, "Stored data index %i (count: %i)", curr_index, received_count); 
+                        } else {
+                            ESP_LOGW(TAG_SENSOR," Duplicate of data at %i index", curr_index); 
+                        }
+                        
+                        if ((received_count == SENSOR_MAX_IND) || (curr_index >= 5)) {
+                            xQueueSend(data_queue, sensor_buffer, portMAX_DELAY); 
+                            memset(sensor_buffer, 0 , sizeof(sensor_buffer)); 
+                            memset(index_received, 0 , sizeof(index_received)); 
+                            received_count= 0 ; 
+                            ESP_LOGI(TAG_SENSOR, "Batch sent to SIM Task"); 
+                        }
+                    } else{
+                        ESP_LOGW(TAG_SENSOR, "Invalid index received: %i", temp_data.index); 
                     }
-                                  
-                    // xQueueSend(data_queue,&sensor_received, portMAX_DELAY);
-                    //ESP_LOGI(TAG_SENSOR, "Data sent to queue"); 
-                  
+
+                    //based on the index values
+                    memset(uart_rx_buffer, '\0', sizeof(uart_rx_buffer)); 
+                    
                     break;
                 case '4': 
                 //trigger ack; 
@@ -194,7 +204,8 @@ static void process_uart_task (void* arg){
                     break; 
                 
             }
-            
+            memset(rx_data_buffer, '\0', UART_BUFFER_SIZE);
+           
         }
     }
 }
@@ -235,25 +246,38 @@ static void parse_sensor_data (char* buffer, Sensor_Data* sensor){
                         sensor->index = atoi(value); 
                     } else  if (strcmp(key,"time")==0) {
                         strncpy(sensor->timestamp, value, sizeof(sensor->timestamp) - 1);
-                        sensor->timestamp[sizeof(sensor->timestamp)] = '\0'; 
+                        sensor->timestamp[sizeof(sensor->timestamp)-1] = '\0'; 
                     } else{
                         ESP_LOGW(TAG_SENSOR, "Invalid payload key.");
+                        break; 
                         //do not process, 
                     }
 
 				}
 		token = strtok(NULL, ",");
-
     }        
+    ESP_LOGI(TAG_SENSOR, "Parsed sensor data: ID=%d, Temp=%.2f, pH=%.2f, DO=%.2f, Batt=%.2f, timestamp=%s, Index=%d, Lowbatt statt=%d", sensor->id, sensor->temp, sensor->pH, sensor->DO, sensor->batt,sensor->timestamp, sensor->index, sensor->lowbatt);
+
 }
 
 
 static void send_to_sim(void *arg){
-    Sensor_Data received_actual[5]; 
+    Sensor_Data sensor_buffer[SENSOR_MAX_IND+1]; 
+  //  Sensor_Data sensor_received; 
+  //  uint8_t ind_buffer[5]; 
+ //   uint8_t index_copy = 0; 
     
     while (1){
-        if (xQueueReceive(data_queue, &received_actual,portMAX_DELAY)){
-            //check missing indexes a  
+            if (xQueueReceive(data_queue, &sensor_buffer, portMAX_DELAY)){
+            //count valid entries ;if not, get hte index aand form the retransmit packet 
+            for(int i=1; i < SENSOR_MAX_IND +1 ; i++){
+                
+                ESP_LOGI(TAG_SIM,"Expected indexes in the sensor buffer, %d",sensor_buffer[i].index);
+            }
+            memset(sensor_buffer, 0, sizeof(sensor_buffer)); 
+ 
+         
+           // memset(ind_buffer, '\0', sizeof(ind_buffer)); 
             //average all readings 
         }
     }

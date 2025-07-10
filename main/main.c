@@ -64,8 +64,9 @@ void init_uart (uart_port_t uart_num, int tx, int rx, int baud);
 static void uart_event_task (void* arg); 
 static void process_uart_task(void* arg); 
 static void parse_sensor_data (char* buffer, Sensor_Data* sensor); 
-static void send_to_sim(void *arg); 
+static void process_to_sim(void *arg); 
 void set_text_message (Sensor_Data* data_buffer, char* to_send, uint8_t count); 
+static void send_from_sim(void* arg); 
 
 
 // rtos handles
@@ -75,8 +76,11 @@ static QueueHandle_t data_queue;
 static TaskHandle_t xProcess; 
 static BaseType_t process_task; 
 
-static TaskHandle_t xSim; 
-static BaseType_t sim_task; 
+static TaskHandle_t xProtoSim; 
+static BaseType_t pro_to_sim;
+
+static TaskHandle_t xSimInit; 
+static BaseType_t sim_init; 
 
 static SemaphoreHandle_t xParseReady;
 
@@ -96,9 +100,11 @@ void app_main(void)
     process_task = xTaskCreate(process_uart_task, "uart_process", 4096, NULL, 6, &xProcess);
     configASSERT(process_task == pdPASS); 
     
-    sim_task = xTaskCreate(send_to_sim, "sim_task", 4096, NULL, 7, &xSim); 
-    configASSERT(sim_task == pdPASS); 
+    pro_to_sim = xTaskCreate(process_to_sim, "process_task", 4096, NULL, 7, &xProtoSim); 
+    configASSERT(pro_to_sim == pdPASS); 
 
+    sim_init = xTaskCreate(send_from_sim, "Sim Task",4096, NULL, 4, &xSimInit);
+    configASSERT(sim_init==pdPASS);
 
 }
 
@@ -274,7 +280,7 @@ static void parse_sensor_data (char* buffer, Sensor_Data* sensor){
 }
 
 
-static void send_to_sim(void *arg){
+static void process_to_sim(void *arg){
     Sensor_Data sensor_buffer[SENSOR_MAX_IND+1]; 
     char text_message[TXT_LEN]; 
     uint8_t valid_count;
@@ -306,6 +312,9 @@ static void send_to_sim(void *arg){
                         uart_write_bytes(UART_PORT_H,tx_ack,strlen(tx_ack)); //send acknowledgement for valid nmumber of data 
                         //proceed to averaging all 
                         set_text_message(sensor_buffer,text_message,valid_count); //enter the function with debugging points
+                        //semaphore for the text 
+
+
                         memset(sensor_recent, 0, sizeof(sensor_recent)); 
                     } else {
                         for(int i=1; i <= SENSOR_MAX_IND  ; i++){
@@ -382,4 +391,6 @@ void set_text_message (Sensor_Data* data_buffer, char* to_send, uint8_t count){
 
 }
 
-  
+void send_from_sim (void *arg){
+
+}

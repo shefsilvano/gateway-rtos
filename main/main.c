@@ -270,6 +270,7 @@ static void parse_sensor_data (char* buffer, Sensor_Data* sensor){
 static void send_to_sim(void *arg){
     Sensor_Data sensor_buffer[SENSOR_MAX_IND+1]; 
     uint8_t valid_count;
+    char*tx_ack ="type:1,ACK"; 
     //char* retrans ="type:3";
     char index [10];
     char temp[3] ;  
@@ -285,7 +286,7 @@ static void send_to_sim(void *arg){
                 for(int i=1; i < SENSOR_MAX_IND +1 ; i++){
                         if (sensor_buffer[i].index != 0){
                             //ind_buffer[i] = sensor_buffer[i].index; 
-                            valid_count ++; 
+                            valid_count ++;
                         }else{
                             ind_buffer[i]= 1; 
                         }
@@ -294,7 +295,7 @@ static void send_to_sim(void *arg){
                 }
                     if (valid_count > 3){
                         ESP_LOGI(TAG_SIM, "valid count %i", valid_count); 
-
+                        uart_write_bytes(UART_PORT_H,tx_ack,sizeof(tx_ack)); 
                         //proceed to averaging all 
                     } else {
                         

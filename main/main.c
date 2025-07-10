@@ -20,9 +20,11 @@
 #define UART_PORT_H (UART_NUM_1) //uart port fo the heltec
 #define UART_PORT_SIM (UART_NUM_2) //uart port for the sim card module
 
-#define SENSOR_MAX_IND (5)
+#define SENSOR_MAX_IND (3)
 #define SENSOR_MIN_IND (1)
+
 #define timestamp_len  (25)
+#define TXT_LEN (160)
 
 // private variables
 char* tx_data = "Hello world from TSIM\r\n"; 
@@ -39,6 +41,8 @@ static const char *TAG_SENSOR = "SENSOR_LOG";
 static const char *TAG_SIM = "UART_SIM_LOG";
 
 
+
+
 typedef struct {
     uint16_t id;
     uint8_t type;
@@ -52,7 +56,7 @@ typedef struct {
     uint8_t curr_index; 
 } Sensor_Data; 
 
-Sensor_Data sensor_received;  //for debugginug only 
+Sensor_Data sensor_recent[SENSOR_MAX_IND+1]; //to hold data yet to be processed after packet retransmission 
 
 
 //prototype functions 
@@ -61,13 +65,12 @@ static void uart_event_task (void* arg);
 static void process_uart_task(void* arg); 
 static void parse_sensor_data (char* buffer, Sensor_Data* sensor); 
 static void send_to_sim(void *arg); 
+void set_text_message (Sensor_Data* data_buffer, char* to_send, uint8_t count); 
 
 
 // rtos handles
 static QueueHandle_t uart_queue;
 static QueueHandle_t data_queue; 
-static QueueHandle_t count_queue; 
-
 
 static TaskHandle_t xProcess; 
 static BaseType_t process_task; 
@@ -183,12 +186,13 @@ static void process_uart_task (void* arg){
                         }
                         
                         if ((received_count == SENSOR_MAX_IND) || (curr_index >= 5)) {
+                            ESP_LOGI(TAG_SENSOR, "Batch sent to SIM Task"); 
                             xQueueSend(data_queue, sensor_buffer, portMAX_DELAY); 
                            // xQueueSend(count_queue,received_count, portMAX_DELAY); 
                             memset(sensor_buffer, 0 , sizeof(sensor_buffer)); 
                             memset(index_received, 0 , sizeof(index_received)); 
                             received_count= 0 ; 
-                            ESP_LOGI(TAG_SENSOR, "Batch sent to SIM Task"); 
+                            
                         }
                     } else{
                         ESP_LOGW(TAG_SENSOR, "Invalid index received: %i", temp_data.index); 
@@ -204,7 +208,10 @@ static void process_uart_task (void* arg){
                     uart_write_bytes(UART_PORT_H,tx_ack,10); 
                     ESP_LOGI(TAG_UART, "Transmitted to Heltec."); 
                     break; 
-                
+
+                case '3':
+                //retransmitted data 
+                    break; 
                 default:
                     ESP_LOGW(TAG_UART, "Invalid payload format."); 
                     break; 
@@ -269,6 +276,7 @@ static void parse_sensor_data (char* buffer, Sensor_Data* sensor){
 
 static void send_to_sim(void *arg){
     Sensor_Data sensor_buffer[SENSOR_MAX_IND+1]; 
+    char text_message[TXT_LEN]; 
     uint8_t valid_count;
     char*tx_ack ="type:1,ACK"; 
     //char* retrans ="type:3";
@@ -283,7 +291,7 @@ static void send_to_sim(void *arg){
             if (xQueueReceive(data_queue, &sensor_buffer, portMAX_DELAY)){
                 valid_count =0 ;    
             //count valid entries ;if not, get hte index aand form the retransmit packet 
-                for(int i=1; i < SENSOR_MAX_IND +1 ; i++){
+                for(int i=1; i <= SENSOR_MAX_IND  ; i++){
                         if (sensor_buffer[i].index != 0){
                             //ind_buffer[i] = sensor_buffer[i].index; 
                             valid_count ++;
@@ -295,11 +303,13 @@ static void send_to_sim(void *arg){
                 }
                     if (valid_count > 3){
                         ESP_LOGI(TAG_SIM, "valid count %i", valid_count); 
-                        uart_write_bytes(UART_PORT_H,tx_ack,sizeof(tx_ack)); 
+                        uart_write_bytes(UART_PORT_H,tx_ack,strlen(tx_ack)); //send acknowledgement for valid nmumber of data 
                         //proceed to averaging all 
+                        set_text_message(sensor_buffer,text_message,valid_count); //enter the function with debugging points
+                        memset(sensor_recent, 0, sizeof(sensor_recent)); 
                     } else {
-                        
-                        for(int i=1; i < SENSOR_MAX_IND +1 ; i++){
+                        for(int i=1; i <= SENSOR_MAX_IND  ; i++){
+                            sensor_recent[i]= sensor_buffer[i];  
                             if (ind_buffer[i]){
                                 memset(temp, '\0', 1);
                                 sprintf(temp, "%d,", i); 
@@ -325,4 +335,51 @@ static void send_to_sim(void *arg){
         }
     }
 }
+
+void set_text_message (Sensor_Data* data_buffer, char* to_send, uint8_t count){
+    float temp= 0; 
+    float ph = 0; 
+    float DO = 0; 
+    float ave_temp = 0 ; 
+    float ave_do = 0; 
+    float ave_ph = 0; 
+    char timestamp[25];
+    char temp_status[20]; 
+    char ph_status[20]; 
+    char do_status[20]; 
+    
+    memset(timestamp, '\0', sizeof(timestamp)); 
+    memset(temp_status, '\0', sizeof(temp_status)); 
+    memset(do_status, '\0', sizeof(do_status));
+    memset(ph_status, '\0', sizeof(ph_status)); 
+
+    strncpy(timestamp, data_buffer[count].timestamp, sizeof(timestamp));
+    for (int i=1; i <= count;i++){
+        temp += data_buffer[i].temp; 
+        DO += data_buffer[i].DO; 
+        ph += data_buffer[i].pH; 
+    }
+    ave_temp = temp/count; 
+    ave_do = DO/count; 
+    ave_ph = ph/count; 
+    /*
+    if (ave_temp >= 25 && ave_temp <= 31){
+        snprintf(temp_status, sizeof(temp_status), "Normal temp at %0.2f", ave_temp);
+        ESP_LOGI(TAG_SIM, "%s",temp_status); 
+    } 
+    if (ave_ph >=6.5 && ave_ph <= 8.5){
+        snprintf(ph_status, sizeof(ph_status), "Normal ph at %0.2f", ave_ph);
+        ESP_LOGI(TAG_SIM, "%s",ph_status); 
+    }
+    if (ave_do >= 5){
+        snprintf(do_status, sizeof(do_status), "Normal do at %0.2f", ave_do);
+        ESP_LOGI(TAG_SIM, "%s",do_status);
+        //print normal 
+    }*/
+
+    snprintf(to_send, TXT_LEN, "Time: %s\n%s\n%s\n%s", timestamp, temp_status, ph_status, do_status);
+    ESP_LOGI(TAG_SIM, "TEMP: %0.2f, DO:%0.2f, pH:%0.2f, timestamp:%s", ave_temp, ave_do, ave_ph, timestamp); 
+
+}
+
   

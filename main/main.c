@@ -66,6 +66,8 @@ static void send_to_sim(void *arg);
 // rtos handles
 static QueueHandle_t uart_queue;
 static QueueHandle_t data_queue; 
+static QueueHandle_t count_queue; 
+
 
 static TaskHandle_t xProcess; 
 static BaseType_t process_task; 
@@ -85,6 +87,7 @@ void app_main(void)
 
     xParseReady = xSemaphoreCreateBinary(); 
     data_queue = xQueueCreate(1,(sizeof(Sensor_Data))*(SENSOR_MAX_IND+1)); // queue initialization
+      
 
     xTaskCreate(uart_event_task, "uart_event", 4096, NULL, 5, NULL); 
     process_task = xTaskCreate(process_uart_task, "uart_process", 4096, NULL, 6, &xProcess);
@@ -155,12 +158,14 @@ static void process_uart_task (void* arg){
     char rx_data_buffer[UART_BUFFER_SIZE];
     Sensor_Data sensor_buffer[SENSOR_MAX_IND+1];
     memset(sensor_buffer, 0, sizeof(sensor_buffer));
+
+
     while (1){
-        if (xSemaphoreTake(xParseReady, portMAX_DELAY)){ 
-             
+        if (xSemaphoreTake(xParseReady, portMAX_DELAY)){
             memset(rx_data_buffer,'\0',UART_BUFFER_SIZE); 
             strcpy(rx_data_buffer, &uart_rx_buffer[5]);
-            memset(uart_rx_buffer,'\0',UART_BUFFER_SIZE); 
+            memset(uart_rx_buffer,'\0',UART_BUFFER_SIZE);
+       
             switch (rx_data_buffer[5]){
                 case '0':
                     Sensor_Data temp_data={0}; //struct used only for this purpose; temporary data 
@@ -179,6 +184,7 @@ static void process_uart_task (void* arg){
                         
                         if ((received_count == SENSOR_MAX_IND) || (curr_index >= 5)) {
                             xQueueSend(data_queue, sensor_buffer, portMAX_DELAY); 
+                           // xQueueSend(count_queue,received_count, portMAX_DELAY); 
                             memset(sensor_buffer, 0 , sizeof(sensor_buffer)); 
                             memset(index_received, 0 , sizeof(index_received)); 
                             received_count= 0 ; 
@@ -263,18 +269,54 @@ static void parse_sensor_data (char* buffer, Sensor_Data* sensor){
 
 static void send_to_sim(void *arg){
     Sensor_Data sensor_buffer[SENSOR_MAX_IND+1]; 
+    uint8_t valid_count;
+    //char* retrans ="type:3";
+    char index [10];
+    char temp[3] ;  
   //  Sensor_Data sensor_received; 
-  //  uint8_t ind_buffer[5]; 
+    uint8_t ind_buffer[5]; 
  //   uint8_t index_copy = 0; 
     
     while (1){
+            
             if (xQueueReceive(data_queue, &sensor_buffer, portMAX_DELAY)){
+                valid_count =0 ;    
             //count valid entries ;if not, get hte index aand form the retransmit packet 
-            for(int i=1; i < SENSOR_MAX_IND +1 ; i++){
-                
-                ESP_LOGI(TAG_SIM,"Expected indexes in the sensor buffer, %d",sensor_buffer[i].index);
-            }
-            memset(sensor_buffer, 0, sizeof(sensor_buffer)); 
+                for(int i=1; i < SENSOR_MAX_IND +1 ; i++){
+                        if (sensor_buffer[i].index != 0){
+                            //ind_buffer[i] = sensor_buffer[i].index; 
+                            valid_count ++; 
+                        }else{
+                            ind_buffer[i]= 1; 
+                        }
+                     ESP_LOGI(TAG_SIM,"Expected lost indices  in the sensor buffer, %d",sensor_buffer[i].index);
+                     ESP_LOGI(TAG_SIM, "index buffer %d", ind_buffer[i]); 
+                }
+                    if (valid_count > 3){
+                        ESP_LOGI(TAG_SIM, "valid count %i", valid_count); 
+
+                        //proceed to averaging all 
+                    } else {
+                        
+                        for(int i=1; i < SENSOR_MAX_IND +1 ; i++){
+                            if (ind_buffer[i]){
+                                memset(temp, '\0', 1);
+                                sprintf(temp, "%d,", i); 
+                                strcat(index, temp);
+                            }
+                            
+                        }
+                        char retransmit [30] = "type:3,ind:";
+                        strcat(retransmit,index);
+                        ESP_LOGI(TAG_SIM, "sending restrans string %s", retransmit); 
+                        uart_write_bytes(UART_PORT_H,retransmit,sizeof(retransmit)); 
+                        memset(retransmit, '\0', sizeof(retransmit));
+                        memset(index, '\0', sizeof(index)); 
+                        memset(ind_buffer,0, sizeof(ind_buffer)); 
+                    }
+                memset(sensor_buffer, 0, sizeof(sensor_buffer)); 
+               // memset(ind_buffer, 0, sizeof(ind_buffer)); 
+
  
          
            // memset(ind_buffer, '\0', sizeof(ind_buffer)); 

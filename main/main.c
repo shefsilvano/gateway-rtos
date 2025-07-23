@@ -14,12 +14,13 @@
 //defines
 #define UART_HELTEC_TX (33)
 #define UART_HELTEC_RX (34)
-#define UART_SIM_TX (26) 
-#define UART_SIM_RX (27)//based on its pin def, will not be entirely used
+#define UART_SIM_TX (27)
+#define UART_SIM_RX (26)//based on its pin def, will not be entirely used
 
 #define UART_BUFFER_SIZE 128
 #define UART_PORT_H (UART_NUM_1) //uart port fo the heltec
 #define UART_PORT_SIM (UART_NUM_2) //uart port for the sim card module
+#define TSIM_PWR (4)
 
 #define SENSOR_MAX_IND (3)
 #define SENSOR_MIN_IND (1)
@@ -28,7 +29,8 @@
 #define TXT_LEN (160)
 
 // rtos handles
-static QueueHandle_t uart_queue;
+static QueueHandle_t uart_queue1;
+static QueueHandle_t uart_queue2; 
 static QueueHandle_t data_queue; 
 
 static TaskHandle_t xProcess; 
@@ -37,8 +39,8 @@ static BaseType_t process_task;
 static TaskHandle_t xProtoSim; 
 static BaseType_t pro_to_sim;
 
-//static TaskHandle_t xSimInit; 
-//static BaseType_t sim_init;   
+static TaskHandle_t xSimInit; 
+static BaseType_t sim_init;   
 
 static SemaphoreHandle_t xParseReady;
 static SemaphoreHandle_t xSensorReady;
@@ -74,23 +76,27 @@ typedef struct {
     float pH;
     float batt;
     bool lowbatt; 
+    bool retransmitted; 
     uint8_t curr_index;     
 } Sensor_Data; 
 
-
+Sensor_Data sensor_recent[SENSOR_MAX_IND+1]; //to hold data yet to be processed after packet retransmission 
 Sensor_Data sensor_buffer[SENSOR_MAX_IND+1];
 bool index_received[SENSOR_MAX_IND+1] ={false};
 uint8_t received_count= 0;
 
 //prototype functions 
-void init_uart (uart_port_t uart_num, int tx, int rx, int baud); 
+void init_uart (uart_port_t uart_num, int tx, int rx, int baud,QueueHandle_t* uart_queue); 
 static void uart_event_task (void* arg); 
 static void process_uart_task(void* arg); 
 static void parse_sensor_data (char* buffer, Sensor_Data* sensor); 
 static void process_to_sim(void *arg); 
 void set_text_message (Sensor_Data* data_buffer, char* to_send, uint8_t count); 
-static void send_from_sim(void* arg); 
+//static void send_from_sim(void* arg); 
 void sensor_timeout_callback(TimerHandle_t xTimer); 
+void send_at_command (const char* cmd);
+void sim7000G_init (void); 
+
 
 
 
@@ -99,11 +105,9 @@ void sensor_timeout_callback(TimerHandle_t xTimer);
 
 void app_main(void)
 {
-    init_uart(UART_PORT_H, UART_HELTEC_TX, UART_HELTEC_RX,38400); 
-    //init_uart(UART_PORT_SIM, UART_SIM_TX, UART_SIM_RX); 
-
+    init_uart(UART_PORT_H, UART_HELTEC_TX, UART_HELTEC_RX,38400, &uart_queue1); 
     xParseReady = xSemaphoreCreateBinary(); 
-   // xSensorReady = xSemaphoreCreateBinary();
+    xSensorReady = xSemaphoreCreateBinary();
    //  configASSERT(xReceiveTimeout ==pdPASS); 
 
      
@@ -119,20 +123,59 @@ void app_main(void)
     pro_to_sim = xTaskCreate(process_to_sim, "process_task", 4096, NULL, 7, &xProtoSim); 
     configASSERT(pro_to_sim == pdPASS); 
 
-   // sim_init = xTaskCreate(send_from_sim, "Sim Task",4096, NULL, 4, &xSimInit);
-   // configASSERT(sim_init==pdPASS);
+    //sim7000G_init();    
+
+    //sim_init = xTaskCreate(send_from_sim, "Sim Task",4096, NULL, 8, &xSimInit);
+    //configASSERT(sim_init==pdPASS);
 
 
 
 }
+void init_uart (uart_port_t uart_num, int tx, int rx, int baud,QueueHandle_t* uart_queue){
+     uart_config_t uart_config = {
+    .baud_rate =baud, 
+    .data_bits = UART_DATA_8_BITS, 
+    .parity = UART_PARITY_DISABLE, 
+    .stop_bits = UART_STOP_BITS_1, 
+    .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+    .source_clk = UART_SCLK_APB, 
+    }; 
 
+    uart_param_config(uart_num, &uart_config); 
+    uart_set_pin(uart_num, tx, rx, UART_PIN_NO_CHANGE,UART_PIN_NO_CHANGE); 
+    uart_driver_install(uart_num, 1024, 0, 20, uart_queue,0);
+    
+}
+void sim7000G_init (void){
+    ESP_LOGI(TAG_SIM,"UART for Sim7000G has been initialized"); 
+    
+     gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << TSIM_PWR),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_down_en = 0,
+        .pull_up_en = 0,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io_conf);
+
+    //copied from the ino file used for initial testing of the board 
+    gpio_set_level(TSIM_PWR,1); 
+    ESP_LOGI(TAG_SIM, "TSIM power pin set to high"); 
+    //vTaskDelay(1000/portTICK_PERIOD_MS); 
+   // gpio_set_level(TSIM_PWR, 0); 
+    vTaskDelay(5000/portTICK_PERIOD_MS); 
+    init_uart(UART_PORT_SIM, UART_SIM_TX, UART_SIM_RX,115200, &uart_queue2); //for the sim module
+   // uart_flush_input(UART_PORT_SIM);  // Clear any garbage
+    ESP_LOGI(TAG_SIM, "Power and *UART pin initialized for SIM7000G."); 
+
+}
 static void uart_event_task (void* arg){
     uart_event_t event;
     uint8_t data[UART_BUFFER_SIZE]; 
     int new_line_ctr = 0;
 
-    while (true) {
-        if (xQueueReceive(uart_queue, &event, portMAX_DELAY)) {
+    while (1) {
+        if (xQueueReceive(uart_queue1, &event, portMAX_DELAY)) {
             switch (event.type) {
             case UART_DATA:
                 int len = uart_read_bytes(UART_PORT_H, data, event.size, portMAX_DELAY);
@@ -158,22 +201,12 @@ static void uart_event_task (void* arg){
     }
 }
 
-void init_uart (uart_port_t uart_num, int tx, int rx, int baud){
-     uart_config_t uart_config = {
-    .baud_rate =baud, 
-    .data_bits = UART_DATA_8_BITS, 
-    .parity = UART_PARITY_DISABLE, 
-    .stop_bits = UART_STOP_BITS_1, 
-    .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-    .source_clk = UART_SCLK_APB, 
-    }; 
 
-    uart_param_config(uart_num, &uart_config); 
-    uart_set_pin(uart_num, tx, rx, UART_PIN_NO_CHANGE,UART_PIN_NO_CHANGE); 
-    uart_driver_install(uart_num, 1024, 0, 20, &uart_queue,0);
-    
+
+static void send_from_sim(void* arg){
+    sim7000G_init(); 
+    vTaskDelete(NULL); // Optional: delete task after init
 }
-
 
 static void process_uart_task (void* arg){
    
@@ -187,6 +220,7 @@ static void process_uart_task (void* arg){
     char rx_data_buffer[UART_BUFFER_SIZE];
  
     memset(sensor_buffer, 0, sizeof(sensor_buffer)); 
+    sim7000G_init(); 
 
 
     while (1){
@@ -198,9 +232,9 @@ static void process_uart_task (void* arg){
         
        
             switch (rx_data_buffer[5]){
-                case '0':
-                   if (sensor_ready){
-
+                
+                    case '0':
+                    if (sensor_ready){
                         Sensor_Data temp_data={0}; //struct used only for this purpose; temporary data 
                         parse_sensor_data(rx_data_buffer,&temp_data); //parse payload
                         
@@ -217,7 +251,7 @@ static void process_uart_task (void* arg){
                             
                             if (received_count && !sensor_timeout){
                                 xTimerStart(xReceiveTimeout, 0); 
-                                ESP_LOGW(TAG_SENSOR, "Software timer1 has started"); 
+                                ESP_LOGW(TAG_SENSOR, "Software timer has started"); 
                                 sensor_timeout = true;
                             }
                             
@@ -240,24 +274,31 @@ static void process_uart_task (void* arg){
                         }
 
                         //based on the index values
-                        memset(uart_rx_buffer, '\0', sizeof(uart_rx_buffer)); 
-                    }
-
+                        memset(uart_rx_buffer, '\0', sizeof(uart_rx_buffer));
                     
+                    }
+                    //sensor_ready = false; 
                     break;
+                
                 case '4': 
                 //insert a semaphore that is only activated by restransmit later 
                 //trigger ack; 
                     vTaskDelay(2000/portTICK_PERIOD_MS); 
                     uart_write_bytes(UART_PORT_H,tx_ack,10); 
-                    ESP_LOGI(TAG_UART, "Transmitted to Heltec."); 
+                    ESP_LOGI(TAG_UART, "Transmitted to Heltec.");
                     sensor_ready=true; 
+                    ESP_LOGI(TAG_SENSOR,"Ready to receive sensor payload:%d",sensor_ready ); 
                     //di ko na process timestamp here hehe 
                     break; 
 
                 case '3':
                 //parse retransmitted data,
                 //stick to given index, then add to the process task
+                    if (reTx){
+                        Sensor_Data temp_rtx ={0}; 
+                        parse_sensor_data (rx_data_buffer,&temp_rtx);
+                    }
+
                     break; 
                 default:
                     ESP_LOGW(TAG_UART, "Invalid payload format."); 
@@ -335,9 +376,10 @@ static void parse_sensor_data (char* buffer, Sensor_Data* sensor){
 
 
 static void process_to_sim(void *arg){
-    Sensor_Data sensor_buffer[SENSOR_MAX_IND+1]; 
+    Sensor_Data sensor_buff[SENSOR_MAX_IND+1]; 
     char text_message[TXT_LEN]; 
     uint8_t valid_count;
+    uint8_t reTx_count; 
     char*tx_ack ="type:1,ACK"; 
     //char* retrans ="type:3";
     char index [10];
@@ -348,56 +390,74 @@ static void process_to_sim(void *arg){
     
     while (1){
             
-            if (xQueueReceive(data_queue, &sensor_buffer, portMAX_DELAY)){
-                valid_count =0 ;    
+            if (xQueueReceive(data_queue, &sensor_buff, portMAX_DELAY)){
+                valid_count = 0 ;  
+                
             //count valid entries ;if not, get the index aand form the retransmit packet 
+        
                 for(int i=1; i <= SENSOR_MAX_IND  ; i++){
-                        if (sensor_buffer[i].index != 0){
+                        if (sensor_buff[i].index != 0){
                             //ind_buffer[i] = sensor_buffer[i].index; 
                             valid_count ++;
                         }else{
                             ind_buffer[i]= 1; 
                         }
-                     ESP_LOGI(TAG_SIM,"Expected lost indices  in the sensor buffer, %d",sensor_buffer[i].index);
-                     ESP_LOGI(TAG_SIM, "index buffer %d", ind_buffer[i]); 
+                     ESP_LOGI(TAG_SENSOR,"Expected lost indices  in the sensor buffer, %d",sensor_buff[i].index);
+                     ESP_LOGI(TAG_SENSOR, "index buffer %d", ind_buffer[i]); 
                 }
                 
-                    if (valid_count >= SENSOR_MAX_IND-1){
-                        ESP_LOGI(TAG_SIM, "valid count %i", valid_count); 
-                        uart_write_bytes(UART_PORT_H,tx_ack,strlen(tx_ack)); //send acknowledgement for valid nmumber of data 
-                        //proceed to averaging all 
-                        //set_text_message(sensor_buffer,text_message,valid_count); //enter the function with debugging points
-                        //semaphore for the text 
+                if (valid_count >= SENSOR_MAX_IND-1){
+                    ESP_LOGI(TAG_SIM, "valid count %i", valid_count); 
+                    uart_write_bytes(UART_PORT_H,tx_ack,strlen(tx_ack)); //send acknowledgement for valid nmumber of data 
+                    //proceed to averaging all 
+                    //set_text_message(sensor_buffer,text_message,valid_count); //enter the function with debugging points
+                    //semaphore for the text 
+                //  xSemaphoreGive(xSensorReady); 
+                    send_at_command("AT\r\n"); 
 
+                    memset(sensor_recent, 0, sizeof(sensor_recent)); 
+                } else {
+                    for(int i=1; i <= SENSOR_MAX_IND  ; i++){
+                        sensor_recent[i]= sensor_buffer[i]; //store data from last transmit 
 
-                        memset(sensor_recent, 0, sizeof(sensor_recent)); 
-                    } else {
-                        for(int i=1; i <= SENSOR_MAX_IND  ; i++){
-                            sensor_recent[i]= sensor_buffer[i];  
-                            if (ind_buffer[i]){
-                                memset(temp, '\0', 1);
-                                sprintf(temp, "%d,", i); 
-                                strcat(index, temp);
-                            }
-                            
+                        if (ind_buffer[i]){
+                            memset(temp, '\0', 1);
+                            sprintf(temp, "%d,", i); 
+                            strcat(index, temp);
                         }
-                        char retransmit [30] = "type:3,ind:";
-                        strcat(retransmit,index);
-                        ESP_LOGI(TAG_SIM, "sending restrans string %s", retransmit); 
-                        uart_write_bytes(UART_PORT_H,retransmit,sizeof(retransmit)); 
-                        memset(retransmit, '\0', sizeof(retransmit));
-                        memset(index, '\0', sizeof(index)); 
-                        memset(ind_buffer,0, sizeof(ind_buffer)); 
-                        //valid_count = 0; 
+                        
+                    }
+                    char retransmit [30] = "type:3,ind:";
+                    strcat(retransmit,index);
+                    ESP_LOGI(TAG_SENSOR, "sending restrans string %s", retransmit); 
+                    uart_write_bytes(UART_PORT_H,retransmit,sizeof(retransmit)); 
+                    reTx = true; 
+                  //  memcpy(sensor_recent, sensor_buffer, sizeof(sensor_buffer)); 
+                    memset(retransmit, '\0', sizeof(retransmit));
+                    memset(index, '\0', sizeof(index)); 
+                    memset(ind_buffer,0, sizeof(ind_buffer)); 
+                    //valid_count = 0; 
                     }
                 memset(sensor_buffer, 0, sizeof(sensor_buffer)); 
                // memset(ind_buffer, 0, sizeof(ind_buffer)); 
-
  
-         
-           // memset(ind_buffer, '\0', sizeof(ind_buffer)); 
             //average all readings 
         }
+    }
+}
+void send_at_command (const char* cmd){
+   
+    uart_write_bytes(UART_PORT_SIM,cmd, strlen(cmd)); 
+    ESP_LOGI(TAG_SIM, "Sent command: %s",cmd); 
+    vTaskDelay(1000/portTICK_PERIOD_MS); 
+    uint8_t  rx_buffer[UART_BUFFER_SIZE] = {0}; 
+    vTaskDelay(500/portTICK_PERIOD_MS); 
+    int len = uart_read_bytes(UART_PORT_SIM, rx_buffer, UART_BUFFER_SIZE-1, 1000/portTICK_PERIOD_MS);
+    if (len>0){
+        rx_buffer[len] = '\0'; 
+        ESP_LOGI(TAG_SIM, "Sim7000G's Response: %s", (char*)rx_buffer);
+    }else{
+        ESP_LOGE(TAG_SIM, "No resnponse for command:%s", cmd); 
     }
 }
 
@@ -433,8 +493,11 @@ void set_text_message (Sensor_Data* data_buffer, char* to_send, uint8_t count){
     Temperatura: 
     pH:
     Dissolved Oxygen: 
-
-    Ang temperatura ay <masyadong mababa, nasa tamang 
+    Battery ng Sensor:  
+    
+    <Wala pang interpretasyon, might involve nuance in the coding and the meaning of the parameters> 
+    
+    
     if (ave_temp >= 25 && ave_temp <= 31){
         snprintf(temp_status, sizeof(temp_status), "Normal temp at %0.2f", ave_temp);
         ESP_LOGI(TAG_SIM, "%s",temp_status); 

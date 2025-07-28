@@ -23,7 +23,8 @@
     "chrono": "c",
     "variant": "c",
     "format": "c",
-    "thread": "c"
+    "thread": "c",
+    "cstdint": "c"
   },
   "idf.flashType": "UART"
 }

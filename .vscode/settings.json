@@ -21,7 +21,9 @@
     "condition_variable": "c",
     "future": "c",
     "chrono": "c",
-    "variant": "c"
+    "variant": "c",
+    "format": "c",
+    "thread": "c"
   },
   "idf.flashType": "UART"
 }

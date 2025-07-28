@@ -14,13 +14,15 @@
 //defines
 #define UART_HELTEC_TX (33)
 #define UART_HELTEC_RX (34)
-#define UART_SIM_TX (27)
-#define UART_SIM_RX (26)//based on its pin def, will not be entirely used
+#define UART_SIM_TX (27) //GSM Rx -> IO27
+#define UART_SIM_RX (26) //GSM Tx -> IO2
+
 
 #define UART_BUFFER_SIZE 128
+#define UART_SIM_BUFFER (248)
 #define UART_PORT_H (UART_NUM_1) //uart port fo the heltec
 #define UART_PORT_SIM (UART_NUM_2) //uart port for the sim card module
-#define TSIM_PWR (4)
+#define TSIM_PWR (GPIO_NUM_4)
 
 #define SENSOR_MAX_IND (3)
 #define SENSOR_MIN_IND (1)
@@ -30,7 +32,6 @@
 
 // rtos handles
 static QueueHandle_t uart_queue1;
-static QueueHandle_t uart_queue2; 
 static QueueHandle_t data_queue; 
 
 static TaskHandle_t xProcess; 
@@ -39,11 +40,11 @@ static BaseType_t process_task;
 static TaskHandle_t xProtoSim; 
 static BaseType_t pro_to_sim;
 
-static TaskHandle_t xSimInit; 
-static BaseType_t sim_init;   
+//static TaskHandle_t xSimInit; 
+//static BaseType_t sim_init;   
 
 static SemaphoreHandle_t xParseReady;
-static SemaphoreHandle_t xSensorReady;
+static SemaphoreHandle_t xSendGSM;
 static TimerHandle_t xReceiveTimeout = NULL;
 
 
@@ -54,6 +55,8 @@ char rx_data[128];
 
 uint8_t new_line_ctr=0;
 char uart_rx_buffer[UART_BUFFER_SIZE];  //for the data sent copied from the rx_buffer
+char uart_at_buffer[UART_BUFFER_SIZE]; 
+uint16_t uart_at_index =0; 
 uint16_t uart_rx_index = 0;
 char uart_rx_char;
 bool parse_ready = false; //gawing binary semaphore (kapag gumagana na) 
@@ -65,6 +68,8 @@ static const char *TAG_SIM = "UART_SIM_LOG";
 static bool sensor_timeout = false; //for the payload timer
 static bool sensor_ready = false; 
 static bool reTx = false; 
+
+bool at_success= false; 
 
 typedef struct {
     uint16_t id;
@@ -86,16 +91,19 @@ bool index_received[SENSOR_MAX_IND+1] ={false};
 uint8_t received_count= 0;
 
 //prototype functions 
-void init_uart (uart_port_t uart_num, int tx, int rx, int baud,QueueHandle_t* uart_queue); 
+void init_uart (uart_port_t uart_num, int tx, int rx, int baud,QueueHandle_t* uart_queue,uint8_t queue_stack); 
 static void uart_event_task (void* arg); 
 static void process_uart_task(void* arg); 
 static void parse_sensor_data (char* buffer, Sensor_Data* sensor); 
 static void process_to_sim(void *arg); 
+static void module_init(void);
 void set_text_message (Sensor_Data* data_buffer, char* to_send, uint8_t count); 
 //static void send_from_sim(void* arg); 
 void sensor_timeout_callback(TimerHandle_t xTimer); 
-void send_at_command (const char* cmd);
+bool sendATCommand(char* command, char* expectedResponse, int timeoutMs); 
+bool parse_data(uint8_t* data, size_t len, int timeout_ms , const char* word); 
 void sim7000G_init (void); 
+
 
 
 
@@ -105,33 +113,31 @@ void sim7000G_init (void);
 
 void app_main(void)
 {
-    init_uart(UART_PORT_H, UART_HELTEC_TX, UART_HELTEC_RX,38400, &uart_queue1); 
-    xParseReady = xSemaphoreCreateBinary(); 
-    xSensorReady = xSemaphoreCreateBinary();
-   //  configASSERT(xReceiveTimeout ==pdPASS); 
+    init_uart(UART_PORT_H, UART_HELTEC_TX, UART_HELTEC_RX,38400, &uart_queue1, 20); //to initialize interrupt-baesd UART reception
 
+    xTaskCreate(uart_event_task, "uart_event", 4096, NULL, 5, NULL);  
+    xParseReady = xSemaphoreCreateBinary(); 
+    //xSendGSM = xSemaphoreCreateBinary();
      
     data_queue = xQueueCreate(1,(sizeof(Sensor_Data))*(SENSOR_MAX_IND+1)); // queue initialization
     
+    
+
+    //sim_init = xTaskCreate(module_init, "Sim-Init", 4096, NULL, 8, &xSimInit); 
+    //configASSERT(sim_init==pdPASS); 
+
     xReceiveTimeout = xTimerCreate("Sensor-Timeout", pdMS_TO_TICKS(SENSOR_RECEIVE_TIMEOUT), pdFALSE, NULL, sensor_timeout_callback); 
 
-
-    xTaskCreate(uart_event_task, "uart_event", 4096, NULL, 5, NULL); 
     process_task = xTaskCreate(process_uart_task, "uart_process", 4096, NULL, 6, &xProcess);
     configASSERT(process_task == pdPASS); 
     
     pro_to_sim = xTaskCreate(process_to_sim, "process_task", 4096, NULL, 7, &xProtoSim); 
     configASSERT(pro_to_sim == pdPASS); 
 
-    //sim7000G_init();    
-
-    //sim_init = xTaskCreate(send_from_sim, "Sim Task",4096, NULL, 8, &xSimInit);
-    //configASSERT(sim_init==pdPASS);
-
 
 
 }
-void init_uart (uart_port_t uart_num, int tx, int rx, int baud,QueueHandle_t* uart_queue){
+void init_uart (uart_port_t uart_num, int tx, int rx, int baud,QueueHandle_t* uart_queue, uint8_t queue_stack){
      uart_config_t uart_config = {
     .baud_rate =baud, 
     .data_bits = UART_DATA_8_BITS, 
@@ -143,13 +149,13 @@ void init_uart (uart_port_t uart_num, int tx, int rx, int baud,QueueHandle_t* ua
 
     uart_param_config(uart_num, &uart_config); 
     uart_set_pin(uart_num, tx, rx, UART_PIN_NO_CHANGE,UART_PIN_NO_CHANGE); 
-    uart_driver_install(uart_num, 1024, 0, 20, uart_queue,0);
+    uart_driver_install(uart_num, 1024, 0, queue_stack, uart_queue,0);
     
 }
 void sim7000G_init (void){
     ESP_LOGI(TAG_SIM,"UART for Sim7000G has been initialized"); 
-    
-     gpio_config_t io_conf = {
+    init_uart(UART_PORT_SIM, UART_SIM_TX, UART_SIM_RX, 115200, NULL, 0);
+    gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << TSIM_PWR),
         .mode = GPIO_MODE_OUTPUT,
         .pull_down_en = 0,
@@ -157,18 +163,16 @@ void sim7000G_init (void){
         .intr_type = GPIO_INTR_DISABLE
     };
     gpio_config(&io_conf);
-
     //copied from the ino file used for initial testing of the board 
     gpio_set_level(TSIM_PWR,1); 
-    ESP_LOGI(TAG_SIM, "TSIM power pin set to high"); 
-    //vTaskDelay(1000/portTICK_PERIOD_MS); 
-   // gpio_set_level(TSIM_PWR, 0); 
-    vTaskDelay(5000/portTICK_PERIOD_MS); 
-    init_uart(UART_PORT_SIM, UART_SIM_TX, UART_SIM_RX,115200, &uart_queue2); //for the sim module
-   // uart_flush_input(UART_PORT_SIM);  // Clear any garbage
-    ESP_LOGI(TAG_SIM, "Power and *UART pin initialized for SIM7000G."); 
-
+    ESP_LOGI(TAG_SIM, "TSIM power pin set to low for 1 sec"); 
+    //vTaskDelay(1000/portTICK_PERIOD_MS);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    gpio_set_level(TSIM_PWR, 0);
+    ESP_LOGI(TAG_SIM, "waiting to boot..."); 
+    vTaskDelay(pdMS_TO_TICKS(5000)); //wait to boot 
 }
+
 static void uart_event_task (void* arg){
     uart_event_t event;
     uint8_t data[UART_BUFFER_SIZE]; 
@@ -203,9 +207,26 @@ static void uart_event_task (void* arg){
 
 
 
-static void send_from_sim(void* arg){
+static void module_init(void){
     sim7000G_init(); 
-    vTaskDelete(NULL); // Optional: delete task after init
+    uint8_t counter = 0; 
+    while (1){
+        at_success = sendATCommand("AT\r\n", "OK", 500);
+
+            if (at_success)
+            {
+                ESP_LOGI(TAG_SIM, "Module Initialization done successfully with final count: %d", counter++);
+                sendATCommand("AT+CGREG?\r\n","+CGREG: 0,1",500);
+                sendATCommand("AT+CMNB=1\r\n","OK",500); 
+                sendATCommand("AT+CMGF=1\r\n","OK",500); 
+                sendATCommand("AT+CSCS=\"GSM\"\r\n","OK",500);     
+            } 
+
+            else
+            {
+                ESP_LOGW(TAG_SIM,"Module Initialization fail, with count:%d\n ",counter++);
+            }
+    }
 }
 
 static void process_uart_task (void* arg){
@@ -220,7 +241,6 @@ static void process_uart_task (void* arg){
     char rx_data_buffer[UART_BUFFER_SIZE];
  
     memset(sensor_buffer, 0, sizeof(sensor_buffer)); 
-    sim7000G_init(); 
 
 
     while (1){
@@ -232,7 +252,6 @@ static void process_uart_task (void* arg){
         
        
             switch (rx_data_buffer[5]){
-                
                     case '0':
                     if (sensor_ready){
                         Sensor_Data temp_data={0}; //struct used only for this purpose; temporary data 
@@ -283,7 +302,7 @@ static void process_uart_task (void* arg){
                 case '4': 
                 //insert a semaphore that is only activated by restransmit later 
                 //trigger ack; 
-                    vTaskDelay(2000/portTICK_PERIOD_MS); 
+                    vTaskDelay(pdMS_TO_TICKS(2000)); 
                     uart_write_bytes(UART_PORT_H,tx_ack,10); 
                     ESP_LOGI(TAG_UART, "Transmitted to Heltec.");
                     sensor_ready=true; 
@@ -412,8 +431,8 @@ static void process_to_sim(void *arg){
                     //proceed to averaging all 
                     //set_text_message(sensor_buffer,text_message,valid_count); //enter the function with debugging points
                     //semaphore for the text 
-                //  xSemaphoreGive(xSensorReady); 
-                    send_at_command("AT\r\n"); 
+                    //xSemaphoreGive(xSensorReady); 
+        
 
                     memset(sensor_recent, 0, sizeof(sensor_recent)); 
                 } else {
@@ -445,21 +464,34 @@ static void process_to_sim(void *arg){
         }
     }
 }
-void send_at_command (const char* cmd){
-   
-    uart_write_bytes(UART_PORT_SIM,cmd, strlen(cmd)); 
-    ESP_LOGI(TAG_SIM, "Sent command: %s",cmd); 
-    vTaskDelay(1000/portTICK_PERIOD_MS); 
-    uint8_t  rx_buffer[UART_BUFFER_SIZE] = {0}; 
-    vTaskDelay(500/portTICK_PERIOD_MS); 
-    int len = uart_read_bytes(UART_PORT_SIM, rx_buffer, UART_BUFFER_SIZE-1, 1000/portTICK_PERIOD_MS);
-    if (len>0){
-        rx_buffer[len] = '\0'; 
-        ESP_LOGI(TAG_SIM, "Sim7000G's Response: %s", (char*)rx_buffer);
-    }else{
-        ESP_LOGE(TAG_SIM, "No resnponse for command:%s", cmd); 
+
+bool sendATCommand(char* command, char* expectedResponse, int timeoutMs) // Sending AT Command
+{
+    uint8_t buffer[UART_SIM_BUFFER];
+
+    memset(buffer , 0 ,UART_SIM_BUFFER);
+
+    uart_write_bytes(UART_PORT_SIM, command, strlen(command));  
+
+    vTaskDelay(pdMS_TO_TICKS(100)); 
+
+    ESP_LOGI(TAG_SIM ,"Write done");
+
+    bool responseReceived = parse_data(buffer, UART_SIM_BUFFER , timeoutMs, expectedResponse);
+
+    if (responseReceived) 
+    {
+        ESP_LOGI(TAG_SIM, "Command sent successfully!");
+
+        return true;
+
+    } else 
+    {
+        ESP_LOGW(TAG_SIM, "Failed to receive expected response!");
+        return false;
     }
 }
+
 
 void set_text_message (Sensor_Data* data_buffer, char* to_send, uint8_t count){
     float temp= 0; 
@@ -517,3 +549,30 @@ void set_text_message (Sensor_Data* data_buffer, char* to_send, uint8_t count){
 
 }
 
+bool parse_data(uint8_t* data, size_t len, int timeout_ms , const char* word) // function for pasing data 
+{
+    char resp[UART_SIM_BUFFER] = {0};   // Allocate a buffer to hold the received data
+
+    TickType_t start_time = xTaskGetTickCount(); // get the start time of the loop
+    
+
+    while ((xTaskGetTickCount() - start_time) < (timeout_ms / portTICK_PERIOD_MS))
+    {
+        int bytes_read = uart_read_bytes(UART_PORT_SIM, data, len, pdMS_TO_TICKS(500));
+
+        if (bytes_read > 0)
+        {
+            // Append the received data to the buffer
+            strncat(resp, (const char*)data, bytes_read); 
+        
+
+            // Check if the word is present in the buffer
+            if (strstr(resp, word) != NULL)
+            {
+                return true;
+            }
+        }
+    }
+    
+    return false;
+}
